@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="ro">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Frame + Upload + Crop & Download</title>
+<link href="https://unpkg.com/cropperjs@1.5.13/dist/cropper.min.css" rel="stylesheet"/>
+<style>
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:16px;color:#222}
+  header{display:flex;gap:12px;align-items:center;margin-bottom:12px}
+  .box{border:1px solid #ddd;padding:12px;border-radius:8px;background:#fafafa}
+  .row{display:flex;gap:12px;flex-wrap:wrap}
+  #previewWrap{width:100%;max-width:720px;margin-top:12px}
+  img#framePreview{max-width:100%;display:block}
+  .controls{margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .btn{background:#0b76ef;color:white;padding:8px 12px;border-radius:6px;border:0;cursor:pointer}
+  .btn.alt{background:#6c757d}
+  input[type=file]{display:inline-block}
+  #shareLink{width:100%;padding:8px}
+  footer{margin-top:18px;color:#666;font-size:13px}
+  #userArea{display:none}
+  #cropArea{max-width:720px;max-height:720px;background:#111;display:flex;align-items:center;justify-content:center; overflow:hidden}
+  #userImage{max-width:100%;display:block}
+  .small{font-size:13px;color:#555}
+</style>
+</head>
+<body>
+<header>
+  <h1>Frame uploader + crop & download</h1>
+</header>
+
+<section class="box">
+  <h3>Owner / Create link (încarcă frame-ul tău)</h3>
+  <div class="row">
+    <div>
+      <label class="small">Alege frame (PNG cu transparență recomandat):</label><br/>
+      <input id="frameFile" type="file" accept="image/*">
+    </div>
+    <div>
+      <button id="generateLink" class="btn">Generate share link</button>
+      <button id="clearFrame" class="btn alt">Clear</button>
+    </div>
+  </div>
+
+  <div id="previewWrap" style="display:none;margin-top:12px">
+    <div class="small">Preview frame:</div>
+    <img id="framePreview" alt="Frame preview">
+  </div>
+
+  <div style="margin-top:8px;display:flex;gap:8px;flex-direction:column;">
+    <input id="shareLink" placeholder="Link generat va apărea aici..." readonly>
+    <div class="small">Copiezi link-ul și îl share-uiești — utilizatorii îl deschid pentru a folosi frame-ul preconfigurat.</div>
+  </div>
+</section>
+
+<section id="userArea" class="box" style="margin-top:14px">
+  <h3>Upload poza (utilizatori)</h3>
+  <div class="row">
+    <div>
+      <label class="small">Alege poza ta:</label><br/>
+      <input id="userFile" type="file" accept="image/*">
+    </div>
+    <div>
+      <label class="small">Zoom:</label><br/>
+      <input id="zoomRange" type="range" min="0.1" max="3" step="0.01" value="1">
+    </div>
+    <div style="display:flex;align-items:center;">
+      <button id="downloadBtn" class="btn">Download cu frame</button>
+    </div>
+  </div>
+
+  <div id="cropArea" style="margin-top:12px">
+    <img id="userImage" alt="User image for cropping">
+    <canvas id="resultCanvas" style="display:none"></canvas>
+    <img id="frameOverlay" style="position:absolute;pointer-events:none;display:none" alt="frame overlay">
+  </div>
+
+  <div class="small" style="margin-top:8px">
+    Folosește zona de crop pentru a poziționa și scala poza. Frame-ul va fi aplicat peste poza tăiată.
+  </div>
+</section>
+
+<footer>
+  <div>Notă: link-urile encodează frame-ul ca dataURL în parametru. Pentru imagine foarte mare link-ul poate fi lung — dacă folosești în producție, recomand să hostezi frame-ul separat și să folosești URL-ul către el.</div>
+</footer>
+
+<script src="https://unpkg.com/cropperjs@1.5.13/dist/cropper.min.js"></script>
+<script>
+/* Utilitate: citește fișier File -> dataURL */
+function fileToDataURL(file){ return new Promise((res,reject)=>{
+  const r = new FileReader();
+  r.onload = ()=>res(r.result);
+  r.onerror = reject;
+  r.readAsDataURL(file);
+});}
+
+/* parse frame param din URL (caută ?frame=... sau #frame=...) */
+function getFrameFromURL(){
+  try {
+    const u = new URL(window.location.href);
+    let raw = u.searchParams.get('frame') || null;
+    if(!raw){
+      // fallback la hash
+      const h = window.location.hash;
+      const match = h.match(/frame=(.+)/);
+      if(match) raw = decodeURIComponent(match[1]);
+    }
+    return raw;
+  } catch(e){ return null; }
+}
+
+const frameFileInput = document.getElementById('frameFile');
+const generateLinkBtn = document.getElementById('generateLink');
+const framePreview = document.getElementById('framePreview');
+const previewWrap = document.getElementById('previewWrap');
+const shareLinkInput = document.getElementById('shareLink');
+const clearFrameBtn = document.getElementById('clearFrame');
+
+const userArea = document.getElementById('userArea');
+const userFile = document.getElementById('userFile');
+const userImage = document.getElementById('userImage');
+const frameOverlay = document.getElementById('frameOverlay');
+const downloadBtn = document.getElementById('downloadBtn');
+const zoomRange = document.getElementById('zoomRange');
+
+let currentFrameDataURL = null;
+let cropper = null;
+
+/* Load frame if page opened with frame param */
+(async function initFromURL(){
+  const frameParam = getFrameFromURL();
+  if(frameParam){
+    currentFrameDataURL = decodeURIComponent(frameParam);
+    // show frame preview and user area
+    framePreview.src = currentFrameDataURL;
+    previewWrap.style.display = 'block';
+    shareLinkInput.value = window.location.href;
+    // show user UI
+    setupFrameOverlay(currentFrameDataURL);
+    userArea.style.display = 'block';
+  }
+})();
+
+frameFileInput.addEventListener('change', async (e)=>{
+  const f = e.target.files[0];
+  if(!f) return;
+  const data = await fileToDataURL(f);
+  currentFrameDataURL = data;
+  framePreview.src = data;
+  previewWrap.style.display = 'block';
+});
+
+generateLinkBtn.addEventListener('click', async ()=>{
+  if(!currentFrameDataURL){
+    alert('Alege mai întâi un frame.');
+    return;
+  }
+  // encodeURIComponent pentru siguranță
+  const url = new URL(window.location.href);
+  url.searchParams.set('frame', encodeURIComponent(currentFrameDataURL));
+  const share = url.toString();
+  shareLinkInput.value = share;
+  // show user area too (preview + overlay)
+  setupFrameOverlay(currentFrameDataURL);
+  userArea.style.display = 'block';
+  // also update history so link is usable immediately
+  // (we set window.location to the share link so that if user copies from address bar it's the same)
+  try{
+    history.replaceState(null,'',share);
+  }catch(e){}
+});
+
+clearFrameBtn.addEventListener('click', ()=>{
+  currentFrameDataURL = null;
+  frameFileInput.value = '';
+  framePreview.src = '';
+  previewWrap.style.display = 'none';
+  shareLinkInput.value = '';
+  userArea.style.display = 'none';
+  try{ history.replaceState(null,'', location.pathname); }catch(e){}
+});
+
+/* Setup overlay image and keep it hidden until frame loaded */
+function setupFrameOverlay(dataURL){
+  frameOverlay.src = dataURL;
+  frameOverlay.style.display = 'block';
+  // ensure absolute positioning relative to cropArea
+  frameOverlay.style.position = 'absolute';
+  frameOverlay.onload = ()=>{
+    // nothing else here — crop/download uses natural size
+  };
+}
+
+/* USER IMAGE logic */
+userFile.addEventListener('change', async (e)=>{
+  const f = e.target.files[0];
+  if(!f) return;
+  const data = await fileToDataURL(f);
+  loadUserImageForCrop(data);
+});
+
+function loadUserImageForCrop(dataURL){
+  userImage.src = dataURL;
+  userImage.style.display = 'block';
+  // destroy previous cropper
+  if(cropper) { cropper.destroy(); cropper = null; }
+  userImage.onload = ()=>{
+    // create cropper with "cover" style so user can position; we won't force aspect ratio
+    cropper = new Cropper(userImage, {
+      viewMode: 1, // restrict
+      dragMode: 'move',
+      autoCropArea: 1,
+      responsive: true,
+      background: false,
+      modal: true,
+      guides: true,
+      movable: true,
+      zoomOnWheel: true,
+    });
+    // reset zoom range
+    zoomRange.value = 1;
+  };
+}
+
+/* zoom control to scale the cropper image */
+zoomRange.addEventListener('input', ()=>{
+  if(!cropper) return;
+  const z = parseFloat(zoomRange.value);
+  // cropper.zoomTo expects relative scale, use getImageData to compute
+  // Simpler: compute ratio from image naturalWidth -> current displayed width
+  try{
+    const imgData = cropper.getImageData();
+    const currentScale = imgData.scaleX; // scaleX ~ scaleY
+    cropper.zoomTo(z / currentScale * currentScale); // simpler: use zoomTo(z) — cropper interprets zoom level relative to initial? We'll use zoomTo by factor diff
+    // to avoid complexity we'll use zoomBy small amount:
+    // but nice simple approach: setZoom via transform? We trust zoomTo(z) works well enough.
+    cropper.zoomTo(z);
+  }catch(e){}
+});
+
+/* Download: draw cropped canvas at frame size, then overlay frame */
+downloadBtn.addEventListener('click', async ()=>{
+  if(!cropper){
+    alert('Încarcă poza ta mai întâi.');
+    return;
+  }
+  if(!currentFrameDataURL){
+    alert('Frame-ul nu e încărcat.');
+    return;
+  }
+
+  // load frame into Image to obtain natural size
+  const frameImg = new Image();
+  frameImg.crossOrigin = 'anonymous';
+  frameImg.src = currentFrameDataURL;
+  await new Promise((res,rej)=>{ frameImg.onload = res; frameImg.onerror = rej; });
+
+  // Get cropped canvas scaled to frame size
+  // Cropper offers getCroppedCanvas({ width, height })
+  const frameW = frameImg.naturalWidth || 1000;
+  const frameH = frameImg.naturalHeight || 1000;
+
+  // get cropped content scaled to frame size (cover)
+  const croppedCanvas = cropper.getCroppedCanvas({ width: frameW, height: frameH, imageSmoothingQuality: 'high' });
+
+  // create final canvas
+  const finalCanvas = document.createElement('canvas');
+  finalCanvas.width = frameW;
+  finalCanvas.height = frameH;
+  const ctx = finalCanvas.getContext('2d');
+  // draw cropped photo
+  ctx.drawImage(croppedCanvas, 0, 0, frameW, frameH);
+  // draw frame on top
+  ctx.drawImage(frameImg, 0, 0, frameW, frameH);
+
+  // download
+  finalCanvas.toBlob((blob)=>{
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'framed-image.png';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(a.href);
+  }, 'image/png');
+});
+
+/* small enhancement: if window loads with frame param but not shareLink input set, set it */
+window.addEventListener('load', ()=>{
+  if(getFrameFromURL() && !shareLinkInput.value) shareLinkInput.value = window.location.href;
+});
+</script>
+</body>
+</html>
